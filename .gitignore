@@ -1,7 +1,9 @@
 project_2.md
 
-/data
-
 /.venv
 
+token.txt
+
 .DS_Store
+
+__pycache__
