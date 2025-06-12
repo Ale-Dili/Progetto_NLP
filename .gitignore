@@ -7,3 +7,7 @@ token.txt
 .DS_Store
 
 __pycache__
+
+seat/
+stereoset/
+bias_attribute_words.json
