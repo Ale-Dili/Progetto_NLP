@@ -5,39 +5,33 @@ import csv
 import numpy as np
 import difflib
 import torch.nn.functional as F
-
+from math import log
 
 
 def evaluate_crows(model, tokenizer, csv_path='./data/crows/crows_pairs_anonymized.csv', device='mps'):
-    def masked_token_prob(sentence: str, target_tokens: list[str]):
-        """
-        Maschera ciascun token in target_tokens nella sentence e restituisce
-        la probabilità media che il modello predica quei token nelle rispettive posizioni.
-        """
-        probs = []
-        for target_token in target_tokens:
-            tokens = tokenizer.tokenize(sentence)
-            try:
-                idx = tokens.index(target_token)
-            except ValueError:
-                raise ValueError(f"Token '{target_token}' non trovato in: {tokens}")
-            tokens[idx] = tokenizer.mask_token
-
-            enc = tokenizer.encode_plus(
+    
+    def masked_token_prob(tokens, token_idx, target_token):
+        '''
+        Compute probability of a masked token in a sentence a
+            - tokens: tokenized sentence
+            - token_idx: index of the target_token among the tokens (tokenized sentence)
+            - target_token: token to mask
+        '''
+        tokens = tokens[:] #shallow copy to avoid edit by reference
+        tokens[token_idx] = tokenizer.mask_token
+        enc = tokenizer.encode_plus(
                 tokens,
                 is_split_into_words=True,
                 return_tensors="pt"
             )
-            enc.to(device)
-            with torch.no_grad():
-                logits = model(**enc).logits
-
-            mask_pos = (enc["input_ids"][0] == tokenizer.mask_token_id).nonzero(as_tuple=True)[0].item()
-            dist = F.softmax(logits[0, mask_pos], dim=-1)
-            tgt_id = tokenizer.convert_tokens_to_ids(target_token)
-            probs.append(dist[tgt_id].item())
-
-        return sum(probs) / len(probs)
+        enc.to(device)
+        with torch.no_grad():
+            logits = model(**enc).logits
+        #return the position of the masked token. token_idx != mask_pos due to tokenization
+        mask_pos = (enc["input_ids"][0] == tokenizer.mask_token_id).nonzero(as_tuple=True)[0].item() 
+        dist = F.softmax(logits[0, mask_pos], dim=-1)
+        tgt_id = tokenizer.convert_tokens_to_ids(target_token) #token id of the target token. NOTE it is note the idx in the sentence
+        return dist[tgt_id].item()
 
 
     model.to(device)
@@ -89,10 +83,19 @@ def evaluate_crows(model, tokenizer, csv_path='./data/crows/crows_pairs_anonymiz
             if len(stereo_unique)==0 or len(anti_unique)==0:
                 continue
 
-            p_stereo = masked_token_prob(stereo_sent, stereo_unique)
-            p_anti = masked_token_prob(anti_sent,anti_unique)
+            #likelihood stereo
+            stereo_log_likelihood = 0
+            for idx,s_t in enumerate(stereo_token):
+                if s_t not in stereo_unique:
+                    stereo_log_likelihood += log(masked_token_prob(stereo_token,idx,s_t))
+            
+            #likelihood anti
+            anti_log_likelihood = 0
+            for idx,a_t in enumerate(anti_token):
+                if a_t not in anti_unique:
+                    anti_log_likelihood += log(masked_token_prob(anti_token,idx,a_t))
 
-            if p_stereo > p_anti:
+            if stereo_log_likelihood > anti_log_likelihood:
                 n_stereo['general']+=1
                 n_stereo[bias_type]+=1
             else:
@@ -105,5 +108,3 @@ def evaluate_crows(model, tokenizer, csv_path='./data/crows/crows_pairs_anonymiz
         }    
 
         return result
-
-
