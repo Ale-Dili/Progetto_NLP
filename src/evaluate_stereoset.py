@@ -71,16 +71,4 @@ def evaluate_stereoset(model, tokenizer, ds, device="mps"):
     return results
 
 
-from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer,AutoModelForMaskedLM
 
-# carica solo l'intrasentence validation split
-ds = load_dataset("McGill-NLP/stereoset", "intrasentence", split="validation")
-
-model_name = "distilbert/distilbert-base-uncased"
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-model = AutoModelForMaskedLM.from_pretrained(model_name)
-
-scores = evaluate_stereoset(model, tokenizer, ds, device="mps")
-print(scores)
-# -> {'lms': 0.xx, 'ss': 0.yy, 'icat': 0.zz, 'n': 8640}

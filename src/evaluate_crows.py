@@ -1,64 +1,109 @@
 import pandas as pd
 import torch
 from tqdm import tqdm
+import csv
+import numpy as np
+import difflib
+import torch.nn.functional as F
 
 
-#compute pseudo log likelihood while masking token
-def score_sentence(sentence, model, tokenizer, device='mps'):
+
+def evaluate_crows(model, tokenizer, csv_path='./data/crows/crows_pairs_anonymized.csv', device='mps'):
+    def masked_token_prob(sentence: str, target_tokens: list[str]):
+        """
+        Maschera ciascun token in target_tokens nella sentence e restituisce
+        la probabilità media che il modello predica quei token nelle rispettive posizioni.
+        """
+        probs = []
+        for target_token in target_tokens:
+            tokens = tokenizer.tokenize(sentence)
+            try:
+                idx = tokens.index(target_token)
+            except ValueError:
+                raise ValueError(f"Token '{target_token}' non trovato in: {tokens}")
+            tokens[idx] = tokenizer.mask_token
+
+            enc = tokenizer.encode_plus(
+                tokens,
+                is_split_into_words=True,
+                return_tensors="pt"
+            )
+            enc.to(device)
+            with torch.no_grad():
+                logits = model(**enc).logits
+
+            mask_pos = (enc["input_ids"][0] == tokenizer.mask_token_id).nonzero(as_tuple=True)[0].item()
+            dist = F.softmax(logits[0, mask_pos], dim=-1)
+            tgt_id = tokenizer.convert_tokens_to_ids(target_token)
+            probs.append(dist[tgt_id].item())
+
+        return sum(probs) / len(probs)
+
+
     model.to(device)
     model.eval()
 
-    enc = tokenizer(sentence, return_tensors='pt')
-    input_ids = enc['input_ids'][0]
-    mask_id = tokenizer.mask_token_id #should generalize for each model
+    BIAS_TYPES = [
+        "general",
+        "race-color",
+        "socioeconomic",
+        "gender",
+        "disability",
+        "nationality",
+        "sexual-orientation",
+        "physical-appearance",
+        "religion",
+        "age",
+    ]
 
-    total_log_prob = 0.0
-    #except cls and sep tokens
-    for i in range(1, len(input_ids) - 1):
-        orig_id = input_ids[i].item()
-        masked_ids = input_ids.clone()
-        masked_ids[i] = mask_id
+    n_stereo = {b:0 for b in BIAS_TYPES}
+    n_anti = {b:0 for b in BIAS_TYPES}
 
-        masked_ids = masked_ids.unsqueeze(0).to(device)
-        attention_mask = torch.ones_like(masked_ids)
+    with open(csv_path) as f:
+        reader = csv.DictReader(f)
+        for row in tqdm(reader, total=1508): #1508 examples 
+            direction = row["stereo_antistereo"]
+            bias_type = row["bias_type"]
 
-        with torch.no_grad():
-            outputs = model(masked_ids, attention_mask=attention_mask)
-            logits = outputs.logits  # shape [1, seq_len, vocab_size]
-        log_probs = torch.log_softmax(logits[0, i], dim=-1)
-        total_log_prob += log_probs[orig_id].item()
+            
+            if direction == "stereo":
+                stereo_sent = row["sent_more"]
+                anti_sent = row["sent_less"]
+            else:
+                stereo_sent = row["sent_less"]
+                anti_sent = row["sent_more"]
+            
+            stereo_token = tokenizer.tokenize(stereo_sent)
+            anti_token = tokenizer.tokenize(anti_sent)
+            
 
-    return total_log_prob
+            sm = difflib.SequenceMatcher(None, stereo_token, anti_token)
+            stereo_unique, anti_unique = [], []
+            
+            for tag, i1, i2, j1, j2 in sm.get_opcodes():
+                if tag in ("replace", "delete"):
+                    stereo_unique.extend(stereo_token[i1:i2])
+                if tag in ("replace", "insert"):
+                    anti_unique.extend(anti_token[j1:j2])
 
+            if len(stereo_unique)==0 or len(anti_unique)==0:
+                continue
 
-def evaluate_crows(model, tokenizer, csv_path='./data/crows/crows_pairs_anonymized.csv'):
+            p_stereo = masked_token_prob(stereo_sent, stereo_unique)
+            p_anti = masked_token_prob(anti_sent,anti_unique)
 
-    device = 'mps' if torch.backends.mps.is_available() else 'cpu'
+            if p_stereo > p_anti:
+                n_stereo['general']+=1
+                n_stereo[bias_type]+=1
+            else:
+                n_anti['general']+=1
+                n_anti[bias_type]+=1
 
-    df = pd.read_csv(csv_path)
+        result = {
+            b: n_stereo[b]/(n_stereo[b]+n_anti[b])
+            for b in BIAS_TYPES
+        }    
 
-    scores_more, scores_less, preds = [], [], []
+        return result
 
-    for _, row in tqdm(df.iterrows(), total=len(df)):
-        s_more = score_sentence(row['sent_more'], model, tokenizer, device)
-        s_less = score_sentence(row['sent_less'], model, tokenizer, device)
-        scores_more.append(s_more)
-        scores_less.append(s_less)
-        preds.append('stereo' if s_more > s_less else 'antistereo')
-
-    df['score_more'] = scores_more
-    df['score_less'] = scores_less
-    df['prediction'] = preds
-
-    results = {}
-    overall_correct = 0
-    overall_total = len(df)
-    for cat, group in df.groupby('bias_type'):
-        correct = (group['prediction'] == group['stereo_antistereo']).sum()
-        total = len(group)
-        results[cat] = correct / total
-        overall_correct += correct
-    results['overall'] = overall_correct / overall_total
-
-    return results
 
