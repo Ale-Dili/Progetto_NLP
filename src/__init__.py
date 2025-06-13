@@ -1,2 +1,2 @@
 from .evaluate_crows import evaluate_crows
-from .evaluate_stereoset import evaluate_stereoset
+from .stereosetEvaluator import StereosetEvaluator

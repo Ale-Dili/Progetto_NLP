@@ -8,8 +8,5 @@ token.txt
 
 __pycache__
 
-seat/
-stereoset/
-bias_attribute_words.json
 
 main.py
