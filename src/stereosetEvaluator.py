@@ -125,97 +125,42 @@ class StereosetEvaluator:
     def evaluate_intersentence(self):
         with open(self.json_path) as f:
             ds = json.load(f)['data']['intersentence']
-        pass       
-        
+
+        n_stereo = {b:0 for b in self.BIAS_TYPES}
+        n_anti = {b:0 for b in self.BIAS_TYPES}
+
+        count = 0
+
+        for element in tqdm(ds):
+            bias_type = element['bias_type']
+            context = element['context']
 
 
+            for entry in element['sentences']:
+                if entry['gold_label'] == 'stereotype':
+                    stereo_sent = context + self.tokenizer.sep_token + entry['sentence']
+                elif entry['gold_label'] == 'anti-stereotype':
+                    anti_sent = context + self.tokenizer.sep_token + entry['sentence']
 
-#TODO
-def evaluate_stereoset(model, tokenizer, csv_path='./data/crows/crows_pairs_anonymized.csv', device='mps'):
-    def masked_token_prob(sentence: str, target_tokens: list[str]):
-        """
-        Maschera ciascun token in target_tokens nella sentence e restituisce
-        la probabilità media che il modello predica quei token nelle rispettive posizioni.
-        """
-        probs = []
-        for target_token in target_tokens:
-            tokens = tokenizer.tokenize(sentence)
-            try:
-                idx = tokens.index(target_token)
-            except ValueError:
-                raise ValueError(f"Token '{target_token}' non trovato in: {tokens}")
-            tokens[idx] = tokenizer.mask_token
+            stereo_token = self.tokenizer.tokenize(stereo_sent)
+            stereo_sep_idx = stereo_token.index(self.tokenizer.sep_token)
 
-            enc = tokenizer.encode_plus(
-                tokens,
-                is_split_into_words=True,
-                return_tensors="pt"
-            )
-            enc.to(device)
-            with torch.no_grad():
-                logits = model(**enc).logits
+            anti_token = self.tokenizer.tokenize(anti_sent)
+            anti_sep_idx = anti_token.index(self.tokenizer.sep_token)
 
-            mask_pos = (enc["input_ids"][0] == tokenizer.mask_token_id).nonzero(as_tuple=True)[0].item()
-            dist = F.softmax(logits[0, mask_pos], dim=-1)
-            tgt_id = tokenizer.convert_tokens_to_ids(target_token)
-            probs.append(dist[tgt_id].item())
+            stereo_log_likelihood = 0
+            for idx in range(stereo_sep_idx+1, len(stereo_token)):
+                s_t = stereo_token[idx]
+                stereo_log_likelihood += log(self._masked_token_prob(stereo_token,idx,s_t))
+            stereo_log_likelihood /= len(stereo_token)
 
-        return sum(probs) / len(probs)
+            anti_log_likelihood = 0
+            for idx in range(anti_sep_idx+1, len(anti_token)):
+                a_t = anti_token[idx]
+                anti_log_likelihood += log(self._masked_token_prob(anti_token,idx,a_t))
+            anti_log_likelihood /= len(anti_token)
 
-
-    model.to(device)
-    model.eval()
-
-    BIAS_TYPES = [
-        "general",
-        "race-color",
-        "socioeconomic",
-        "gender",
-        "disability",
-        "nationality",
-        "sexual-orientation",
-        "physical-appearance",
-        "religion",
-        "age",
-    ]
-
-    n_stereo = {b:0 for b in BIAS_TYPES}
-    n_anti = {b:0 for b in BIAS_TYPES}
-
-    with open(csv_path) as f:
-        reader = csv.DictReader(f)
-        for row in tqdm(reader, total=1508): #1508 examples 
-            direction = row["stereo_antistereo"]
-            bias_type = row["bias_type"]
-
-            
-            if direction == "stereo":
-                stereo_sent = row["sent_more"]
-                anti_sent = row["sent_less"]
-            else:
-                stereo_sent = row["sent_less"]
-                anti_sent = row["sent_more"]
-            
-            stereo_token = tokenizer.tokenize(stereo_sent)
-            anti_token = tokenizer.tokenize(anti_sent)
-            
-
-            sm = difflib.SequenceMatcher(None, stereo_token, anti_token)
-            stereo_unique, anti_unique = [], []
-            
-            for tag, i1, i2, j1, j2 in sm.get_opcodes():
-                if tag in ("replace", "delete"):
-                    stereo_unique.extend(stereo_token[i1:i2])
-                if tag in ("replace", "insert"):
-                    anti_unique.extend(anti_token[j1:j2])
-
-            if len(stereo_unique)==0 or len(anti_unique)==0:
-                continue
-
-            p_stereo = masked_token_prob(stereo_sent, stereo_unique)
-            p_anti = masked_token_prob(anti_sent,anti_unique)
-
-            if p_stereo > p_anti:
+            if stereo_log_likelihood > anti_log_likelihood:
                 n_stereo['general']+=1
                 n_stereo[bias_type]+=1
             else:
@@ -224,7 +169,7 @@ def evaluate_stereoset(model, tokenizer, csv_path='./data/crows/crows_pairs_anon
 
         result = {
             b: n_stereo[b]/(n_stereo[b]+n_anti[b])
-            for b in BIAS_TYPES
+            for b in self.BIAS_TYPES
         }    
 
         return result
