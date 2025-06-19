@@ -36,13 +36,15 @@ class CDA_Debiaser:
 
 
         training_args = TrainingArguments(
+            output_dir=".",  # <--- evita la creazione di 'trainer_output'
             num_train_epochs=4,
             per_device_train_batch_size=8,
             save_steps=500,
             save_total_limit=2,
-            logging_dir=None,
             save_strategy='no',
-            logging_strategy='no'
+            logging_strategy='no',
+            logging_dir=None,
+            report_to=[]  # disabilita wandb/tensorboard se attivi
         )
 
         trainer = Trainer(
