@@ -9,20 +9,16 @@ import torch.nn.functional as F
 from math import log
 from datasets import load_dataset
 from torch.utils.data import DataLoader
-from transformers import (
-    AutoTokenizer,
-    AutoModelForMaskedLM,
-    DataCollatorForLanguageModeling
-)
+from transformers import DataCollatorForLanguageModeling
+
+from sklearn.metrics import precision_recall_fscore_support
 
 
-#TODO handle more datasets
 class PerformanceEvaluator:
     def __init__(self, model, tokenizer,device='mps'):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
-
         self.model.eval()
         self.model.to(device)
 
@@ -34,10 +30,10 @@ class PerformanceEvaluator:
         return self.tokenizer(batch["text"], truncation=True, max_length=128)
     
 
-    def masked_token_evaluation(self):
+    def masked_token_evaluation(self, K: int = 5):
         DS_NAME = 'stas/openwebtext-10k'
-        SPLIT = "train" #only split available
-        NUM_SAMPLES = 4000             
+        SPLIT = "train"
+        NUM_SAMPLES = 4000
         BATCH_SIZE = 8
         MASK_PROB = 0.15
 
@@ -54,22 +50,45 @@ class PerformanceEvaluator:
         loader = DataLoader(tokenized, batch_size=BATCH_SIZE, collate_fn=collator)
         
         correct, total = 0, 0
+        correct_topk = 0
+
         with torch.no_grad():
             for batch in tqdm(loader):
-                input_ids = batch["input_ids"].to(self.device)
+                input_ids      = batch["input_ids"].to(self.device)
                 attention_mask = batch["attention_mask"].to(self.device)
-                labels    = batch["labels"].to(self.device)
+                labels         = batch["labels"].to(self.device)
 
                 outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
                 logits  = outputs.logits  # (B, L, V)
 
+                # standard accuracy
                 preds = logits.argmax(dim=-1)  # (B, L)
                 mask = labels != -100
-
                 correct += (preds[mask] == labels[mask]).sum().item()
-                total   += mask.sum().item()
-        accuracy = correct / total if total > 0 else 0.0
-        return accuracy
+
+                #top-k accuracy
+                topk_inds = logits.topk(K, dim=-1).indices  # (B, L, K)
+
+                #for each masked position, check if label in top-k
+                correct_topk += (
+                    topk_inds[mask.unsqueeze(-1).expand_as(topk_inds)]  # (sum(mask), K)
+                    .eq(labels[mask].unsqueeze(-1))                  # (sum(mask), K) bool
+                    .any(dim=-1)                                     # (sum(mask),)     bool
+                    .sum()
+                    .item()
+                )
+
+                total += mask.sum().item()
+
+        accuracy     = correct / total if total > 0 else 0.0
+        topk_accuracy = correct_topk / total if total > 0 else 0.0
+
+        return {
+            "accuracy": accuracy,
+            f"top_{K}_accuracy": topk_accuracy
+        }
+
+
 
 
     def text_classification_evaluation(self):
@@ -85,77 +104,49 @@ class PerformanceEvaluator:
         }
 
         dataset = load_dataset(DATASET_NAME, split=SPLIT).select(range(NUM_SAMPLES))
-        correct = 0
+
+        preds = []
+        labels = []
+
         for sample in tqdm(dataset):
             prompt = f"{sample['text']}. {self.tokenizer.sep_token} The news topic is {self.tokenizer.mask_token}."
             inputs = self.tokenizer(prompt, truncation=True, padding="max_length", max_length=128, return_tensors="pt")
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
-            
+
             with torch.no_grad():
                 outputs = self.model(**inputs)
                 logits = outputs.logits
 
-                mask_token_index = torch.where(inputs["input_ids"] == self.tokenizer.mask_token_id)[1]
-                if len(mask_token_index) == 0:
+                mask_positions = torch.where(inputs["input_ids"] == self.tokenizer.mask_token_id)[1]
+                if len(mask_positions) == 0:
                     continue
-            
-                mask_token_logits = logits[0, mask_token_index[0], :]
-                
-                probs = {}
+
+                mask_pos = mask_positions[0].item()
+                mask_logits = logits[0, mask_pos, :]
+
+
+                scores = {}
                 for class_idx, word in class_to_word.items():
-                    word_id = self.tokenizer.encode(word, add_special_tokens=False)[0]
-                    probs[class_idx] = mask_token_logits[word_id].item()
-                
-                pred = max(probs.items(), key=lambda x: x[1])[0]
-                
-            if pred == sample['label']:
-                correct += 1
+                    token_id = self.tokenizer.encode(word, add_special_tokens=False)[0]
+                    scores[class_idx] = mask_logits[token_id].item()
 
-        accuracy = correct / NUM_SAMPLES
-        print(f"Accuracy: {accuracy:.2f}")
-        return accuracy
-        
+                pred = max(scores.items(), key=lambda x: x[1])[0]
 
-#TODO finish
-    def sentiment_analysis_evaluation(self):
-        ds = load_dataset("Sp1786/multiclass-sentiment-analysis-dataset", split='test')
-        class_to_word = {
-            0: "positive",
-            1: "negative",
-            2: "neutral"
+            preds.append(pred)
+            labels.append(sample['label'])
+
+        #macro
+        precision_macro, recall_macro, f1_macro, _ = precision_recall_fscore_support(
+            labels, preds, average="macro", zero_division=0
+        )
+
+
+        return {
+            "accuracy": sum(1 for p,l in zip(preds, labels) if p==l)/len(labels),
+            "precision_macro": precision_macro,
+            "recall_macro": recall_macro,
+            "f1_macro": f1_macro,
         }
 
-        correct = 0
-        total = 0
-
-        for sample in tqdm(ds):
-            #prompt = f"{sample['text']}. {self.tokenizer.sep_token} The sentiment is {self.tokenizer.mask_token}."
-            prompt = f"Review: {sample['text']} Sentiment: {self.tokenizer.mask_token}."
-            inputs = self.tokenizer(prompt, return_tensors="pt")
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-
-            with torch.no_grad():
-                logits = self.model(**inputs).logits
-     
-
-            mask_token_index = torch.where(inputs["input_ids"] == self.tokenizer.mask_token_id)[1]
-            if len(mask_token_index) == 0:
-                continue
-            
-            p = F.softmax(logits[0])[mask_token_index][0]
-
-            probs = {}
-            for class_idx, word in class_to_word.items():
-                word_id = self.tokenizer.convert_tokens_to_ids(word)
-                probs[word] = p[word_id]
-
-            pred = max(probs.items(), key=lambda x: x[1])[0]
 
 
-            if pred == sample['sentiment']:
-                correct += 1
-            total += 1
-
-        accuracy = correct / total 
-        print(f"Accuracy: {accuracy:.2f}")
-        return accuracy
